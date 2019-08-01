@@ -9,6 +9,7 @@ class Client {
     this.pasvSockets = [];
     this.pasvListeners = [];
     this.isPASV = false;
+    this.pwd = "/";
 
     this.socket.on('connect', () => this.onConnect());
     this.socket.on('data', (s) => this.onData(s));
@@ -48,36 +49,46 @@ class Client {
 
   async streamFile(path) {
     const socket = await this.getDataSocket();
-    path = `./${path}`;
-    let [err, stat] = await new Promise((resolve) => fs.stat(path, (...p) => resolve(p)));
-    if (err !== null) {
+    if (socket === undefined) return;
+    path = `./${this.pwd}/${path}`;
+    let stat = await this.getStat(path);
+    if (!stat) {
       this.resp(550, "File not accessible");
     } else {
       let [err, buf] = await new Promise((resolve) => fs.readFile(path, (...p) => resolve(p)));
       this.resp(150, 'Opening connection');
       await new Promise((resolve) => socket.write(buf, resolve));
       this.resp(226, 'DONE');
-      socket.end();
     }
+    socket.end();
   }
 
   async streamDir(path) {
     const socket = await this.getDataSocket();
+    path = `./${this.pwd}/${path}`;
     this.resp(150, 'Opening connection');
     const [err, files] = await new Promise((resolve) => fs.readdir(path, (...p) => resolve(p)));
-    console.log(files);
-    files.forEach((fn) => socket.write(`${fn}\r\n`));
+    const stats = await Promise.all(files.map((fn) => new Promise(resolve => fs.stat(`${path}/${fn}`, (err, stat) => resolve([err, stat, fn])))));
+    stats.forEach((p) => {
+      const [err, stat, fn] = p;
+      if (!stat) {
+        console.log(`* STAT FAILED. ${err}`);
+        return;
+      }
+      stat.perm = parseInt(stat.mode.toString(8), 10);
+      stat.mtimeFmt = (new Date(stat.mtime)).toLocaleDateString('en-US', {month: 'short', year: 'numeric', day: '2-digit'}).split(',').join('');
+      socket.write(`${stat.perm} ${stat.nlink} ${stat.uid} ${stat.gid} ${stat.size} ${stat.mtimeFmt} ${fn}${stat.isDirectory() ? '/' : ''}\r\n`);
+    });
     this.resp(226, 'DONE');
     socket.end();
   }
 
   async getStat(path) {
     const [err, stat] = await new Promise((resolve) => fs.stat(path, (...p) => resolve(p)));
-    if (err === null) {
-      return stat;
-    } else {
-      this.resp(550, "File not accessible");
+    if (err !== null) {
+      console.log(`* STAT FAILED. ${err}`);
     }
+    return stat;
   }
 
   onConnect() {
@@ -135,10 +146,13 @@ class Client {
       this.user = args[0];
       this.resp(230, 'User okay. Logged in.');
     } else if (cmd === 'PWD' && args.length === 0) {
-      this.resp(257, `"/"`);
-    } else if (cmd === 'CWD' && args.length === 1) {
+      this.resp(257, this.pwd);
+    } else if (cmd === 'CWD') {
+      if (args.length === 0) args.push("/");
+      args[0] = `./${args[0]}`;
       this.getStat(args[0]).then((stat) => {
-        if (stat.isDirectory()) {
+        if (stat && stat.isDirectory()) {
+          this.pwd = args[0];
           this.resp(200, 'CWD Okay');
         } else {
           this.resp(550, 'Not a directory');
@@ -148,7 +162,11 @@ class Client {
       this.resp(200, 'Binary mode');
     } else if (cmd === 'SIZE' && args.length === 1) {
       this.getStat(args[0]).then((stat) => {
-        this.resp(213, stat.size);
+        if (stat) {
+          this.resp(213, stat.size);
+        } else {
+          this.resp(550, "File not found");
+        }
       });
     } else if (cmd === 'RETR' && args.length === 1 && this.isAuthed() && this.isPASV) {
       this.streamFile(args[0]);
