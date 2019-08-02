@@ -1,5 +1,6 @@
 const net = require('net');
 const fs = require('fs');
+const path = require('path');
 
 class Client {
   constructor(...p) {
@@ -10,6 +11,7 @@ class Client {
     this.pasvListeners = [];
     this.isPASV = false;
     this.pwd = "/";
+    this.userRoot = __dirname;
 
     this.socket.on('connect', () => this.onConnect());
     this.socket.on('data', (s) => this.onData(s));
@@ -50,7 +52,6 @@ class Client {
   async streamFile(path) {
     const socket = await this.getDataSocket();
     if (socket === undefined) return;
-    path = `./${this.pwd}/${path}`;
     let stat = await this.getStat(path);
     if (!stat) {
       this.resp(550, "File not accessible");
@@ -63,13 +64,12 @@ class Client {
     socket.end();
   }
 
-  async streamDir(path) {
+  async streamDir(userPath) {
     const socket = await this.getDataSocket();
     if (socket === undefined) return;
-    path = `./${this.pwd}/${path}`;
     this.resp(150, 'Opening connection');
-    const [err, files] = await new Promise((resolve) => fs.readdir(path, (...p) => resolve(p)));
-    const stats = await Promise.all(files.map((fn) => new Promise(resolve => fs.stat(`${path}/${fn}`, (err, stat) => resolve([err, stat, fn])))));
+    const [err, files] = await new Promise((resolve) => fs.readdir(userPath, (...p) => resolve(p)));
+    const stats = await Promise.all(files.map((fn) => new Promise(resolve => fs.stat(`${userPath}/${fn}`, (err, stat) => resolve([err, stat, fn])))));
     stats.forEach((p) => {
       const [err, stat, fn] = p;
       if (!stat) {
@@ -84,8 +84,8 @@ class Client {
     socket.end();
   }
 
-  async getStat(path) {
-    const [err, stat] = await new Promise((resolve) => fs.stat(path, (...p) => resolve(p)));
+  async getStat(userPath) {
+    const [err, stat] = await new Promise((resolve) => fs.stat(userPath, (...p) => resolve(p)));
     if (err !== null) {
       console.log(`* STAT FAILED. ${err}`);
     }
@@ -96,6 +96,14 @@ class Client {
 
   }
 
+  getAbsolutePath(userPath) {
+    return path.join(this.userRoot, this.getRelativePath(userPath));
+  }
+
+  getRelativePath(userPath) {
+    return path.normalize(path.join(this.pwd, userPath));
+  }
+
   onData(buf) {
     const data = buf.toString('ascii');
     if (data.includes('\r\n')) {
@@ -103,7 +111,11 @@ class Client {
       lines.pop();
       lines[0] = this.lineBuf + lines[0];
       this.lineBuf = "";
-      lines.forEach((l) => this.parse(l));
+      lines.forEach((l) => {
+        l = l.trimLeft();
+        let i = l.match(/(?:\s|$)/).index;
+        this.command(l.substring(0, i), l.substring(i + 1));
+      });
     } else {
       this.lineBuf += data;
     }
@@ -117,27 +129,13 @@ class Client {
 
   }
 
-  parse(l) {
-    console.log('<', l);
-    const regex = /(?:\s*)([^\s]+)/gi;
-    const parts = [];
-    let match;
-    while ((match = regex.exec(l)) !== null) {
-      parts.push(match[1]);
-    }
-
-    if (parts.length > 0) {
-      this.command(parts);
-    }
-  }
-
-  command(parts) {
-    const [cmd, ...args] = parts;
-    if (cmd === 'PORT' && args.length === 1 && !this.isPASV) {
-      this.activePort = ((p1, p2) => Number(p1) * 256 + Number(p2))(...args[0].split(',').slice(4));
-      this.activeIP = args[0].split(',').slice(0, 4).join('.');
+  command(cmd, argStr) {
+    console.log(`< ${cmd} ${argStr}`);
+    if (cmd === 'PORT' && argStr.trim().length > 0 && !this.isPASV) {
+      this.activePort = ((p1, p2) => Number(p1) * 256 + Number(p2))(...argStr.split(',').slice(4));
+      this.activeIP = argStr.split(',').slice(0, 4).join('.');
       this.resp(200, 'Ports set');
-    } else if (cmd === 'PASV' && args.length === 0) {
+    } else if (cmd === 'PASV' && argStr.trim().length === 0) {
       this.getPASVPort().then((port) => {
         this.isPASV = true;
         let parts = Client.addressToParts(this.socket.address().address, port);
@@ -145,37 +143,37 @@ class Client {
       }).catch(() => {
         this.resp(550, "Failed to change to passive mode");
       });
-    } else if (cmd === 'USER' && args.length === 1) {
-      this.user = args[0];
+    } else if (cmd === 'USER' && argStr.trim().length > 0) {
+      this.user = argStr;
       this.resp(230, 'User okay. Logged in.');
-    } else if (cmd === 'PWD' && args.length === 0) {
+    } else if (cmd === 'PWD' && argStr.trim().length === 0) {
       this.resp(257, this.pwd);
     } else if (cmd === 'CWD') {
-      if (args.length === 0) args.push("/");
-      args[0] = `./${args[0]}`;
-      this.getStat(args[0]).then((stat) => {
+      const userPath = this.getAbsolutePath(argStr);
+      this.getStat(userPath).then((stat) => {
         if (stat && stat.isDirectory()) {
-          this.pwd = args[0];
+          this.pwd = this.getRelativePath(argStr);
           this.resp(200, 'CWD Okay');
         } else {
           this.resp(550, 'Not a directory');
         }
       });
-    } else if (cmd === 'TYPE' && args.length === 1) {
+    } else if (cmd === 'TYPE' && argStr.trim().length > 0) {
       this.resp(200, 'Binary mode');
-    } else if (cmd === 'SIZE' && args.length === 1) {
-      this.getStat(args[0]).then((stat) => {
+    } else if (cmd === 'SIZE' && argStr.trim().length > 0) {
+      const userPath = this.getAbsolutePath(argStr);
+      this.getStat(userPath).then((stat) => {
         if (stat) {
           this.resp(213, stat.size);
         } else {
           this.resp(550, "File not found");
         }
       });
-    } else if (cmd === 'RETR' && args.length === 1 && this.isAuthed() && this.isPASV) {
-      this.streamFile(args[0]);
+    } else if (cmd === 'RETR' && argStr.trim().length > 0 && this.isAuthed() && this.isPASV) {
+      this.streamFile(this.getAbsolutePath(argStr));
     } else if (cmd === 'LIST') {
-      this.streamDir('.');
-    } else if (cmd === 'QUIT' && args.length === 0) {
+      this.streamDir(this.getAbsolutePath(argStr));
+    } else if (cmd === 'QUIT' && argStr.trim().length === 0) {
       this.end();
     } else {
       this.resp(502, 'Command not implemented');
