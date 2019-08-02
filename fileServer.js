@@ -65,6 +65,7 @@ class Client {
 
   async streamDir(path) {
     const socket = await this.getDataSocket();
+    if (socket === undefined) return;
     path = `./${this.pwd}/${path}`;
     this.resp(150, 'Opening connection');
     const [err, files] = await new Promise((resolve) => fs.readdir(path, (...p) => resolve(p)));
@@ -77,7 +78,7 @@ class Client {
       }
       stat.perm = parseInt(stat.mode.toString(8), 10);
       stat.mtimeFmt = (new Date(stat.mtime)).toLocaleDateString('en-US', {month: 'short', year: 'numeric', day: '2-digit'}).split(',').join('');
-      socket.write(`${stat.perm} ${stat.nlink} ${stat.uid} ${stat.gid} ${stat.size} ${stat.mtimeFmt} ${fn}${stat.isDirectory() ? '/' : ''}\r\n`);
+      socket.write(`---------- ${stat.nlink} ${stat.uid} ${stat.gid} ${stat.size} ${stat.mtimeFmt} ${fn}${stat.isDirectory() ? '/' : ''}\r\n`);
     });
     this.resp(226, 'DONE');
     socket.end();
@@ -141,6 +142,8 @@ class Client {
         this.isPASV = true;
         let parts = Client.addressToParts(this.socket.address().address, port);
         this.resp(227, `Passive mode ${port} (${parts.join(',')})`);
+      }).catch(() => {
+        this.resp(550, "Failed to change to passive mode");
       });
     } else if (cmd === 'USER' && args.length === 1) {
       this.user = args[0];
@@ -173,8 +176,7 @@ class Client {
     } else if (cmd === 'LIST') {
       this.streamDir('.');
     } else if (cmd === 'QUIT' && args.length === 0) {
-      this.resp(200, 'BYE');
-      this.socket.end();
+      this.end();
     } else {
       this.resp(502, 'Command not implemented');
     }
@@ -191,6 +193,12 @@ class Client {
 
   start() {
     this.resp(220, 'Ready');
+  }
+
+  end() {
+    this.resp(200, 'BYE');
+    this.pasvListeners.forEach(s => s.close(() => s.unref()));
+    this.socket.end();
   }
 
   static addressToParts(ip, port) {
